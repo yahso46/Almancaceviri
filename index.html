@@ -98,8 +98,8 @@
       <input id="gain" type="range" min="1" max="12" step="0.5" value="4" style="flex:1;accent-color:var(--accent)">
       <output id="gainOut" for="gain" style="min-width:3ch;text-align:right">4x</output>
     </div>
-    <div style="margin-top:10px;height:8px;background:#232b36;border-radius:4px;overflow:hidden"><div id="meter" style="height:100%;width:0%;background:var(--accent)"></div></div>
-    <p class="empty" style="margin:8px 0 0">Bu modda ses cihazda çözülür. İlk açılışta model indirilir, sonra hazır kalır. Yazı cümle bitince, 1-3 saniye gecikmeyle gelir.</p>
+    <div style="margin-top:10px;height:8px;background:#232b36;border-radius:4px;overflow:hidden;position:relative"><div id="meter" style="height:100%;width:0%;background:var(--accent)"></div><div style="position:absolute;left:7.5%;top:0;bottom:0;width:2px;background:#fff" title="algılama eşiği"></div></div>
+    <p class="empty" style="margin:8px 0 0">Çubuk beyaz çizgiyi geçince ses algılanır. Bu modda ses cihazda çözülür. İlk açılışta model indirilir, sonra hazır kalır. Yazı cümle bitince, 1-3 saniye gecikmeyle gelir.</p>
   </section>
 
   <section class="panel">
@@ -292,24 +292,77 @@
 
   /* ---------- Whisper modu (cihazda ses tanıma) ---------- */
   var modeEl = $("mode"), wpanel = $("wpanel"), gainEl = $("gain"), gainOut = $("gainOut"), meterEl = $("meter"), modelEl = $("model");
-  var asr = null, asrModel = "", asrBusy = false, segQueue = [];
+  var worker = null, readyModel = "", loadWaiter = null, runWaiter = null, asrBusy = false, segQueue = [];
   var wCtx = null, wStream = null, wSrc = null, wGainNode = null, wProc = null, wActive = false;
   var seg = [], pre = [], speaking = false, silentSec = 0, segSec = 0;
-  var VOICE_RMS = 0.02, SILENCE_END = 0.9, SEG_MAX = 12, SEG_MIN = 0.5;
+  var VOICE_RMS = 0.015, SILENCE_END = 0.8, SEG_MAX = 8, SEG_MIN = 0.5;
   var HALLUC = /(amara\.org|untertitel|vielen dank (fürs|für das) zuschauen|copyright)/i;
+
+  // Model ayrı bir işçide (Web Worker) çalışır; böylece sayfa donmaz ve ses kaçmaz.
+  var WORKER_SRC = `
+import { pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5";
+let asr = null, name = "";
+self.onmessage = async (e) => {
+  const m = e.data;
+  try {
+    if (m.type === "load") {
+      if (!asr || name !== m.model) {
+        asr = await pipeline("automatic-speech-recognition", m.model, {
+          device: "wasm", dtype: "q8",
+          progress_callback: (p) => self.postMessage({ type: "progress", status: p.status, progress: p.progress, file: p.file })
+        });
+        name = m.model;
+      }
+      self.postMessage({ type: "ready", model: name });
+    } else if (m.type === "run") {
+      const out = await asr(m.audio, { language: "german", task: "transcribe", chunk_length_s: 30 });
+      self.postMessage({ type: "result", text: (out && out.text) || "" });
+    }
+  } catch (err) {
+    self.postMessage({ type: "error", kind: m.type, message: String((err && err.message) || err) });
+  }
+};
+`;
+
+  function ensureWorker() {
+    if (worker) return worker;
+    var url = URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" }));
+    worker = new Worker(url, { type: "module" });
+    worker.onmessage = function (e) {
+      var m = e.data;
+      if (m.type === "progress") {
+        if (m.status === "progress" && typeof m.progress === "number") setStatus("Model yükleniyor… %" + Math.round(m.progress), m.file || "");
+      } else if (m.type === "ready") {
+        readyModel = m.model; dbg("model hazır: " + m.model);
+        if (loadWaiter) { loadWaiter.resolve(); loadWaiter = null; }
+      } else if (m.type === "result") {
+        if (runWaiter) { runWaiter.resolve(m.text); runWaiter = null; }
+      } else if (m.type === "error") {
+        var err = new Error(m.message);
+        if (m.kind === "load" && loadWaiter) { loadWaiter.reject(err); loadWaiter = null; }
+        else if (runWaiter) { runWaiter.reject(err); runWaiter = null; }
+      }
+    };
+    worker.onerror = function (e) {
+      var msg = (e && e.message) || "işçi başlatılamadı";
+      dbg("işçi hatası: " + msg);
+      var err = new Error(msg);
+      if (loadWaiter) { loadWaiter.reject(err); loadWaiter = null; }
+      if (runWaiter) { runWaiter.reject(err); runWaiter = null; }
+      worker = null; readyModel = "";
+    };
+    return worker;
+  }
 
   function loadAsr() {
     var name = modelEl.value;
-    if (asr && asrModel === name) return Promise.resolve();
+    if (readyModel === name) return Promise.resolve();
     setStatus("Model yükleniyor…", "İlk seferde indirme biraz sürer.");
-    return import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5").then(function (mod) {
-      return mod.pipeline("automatic-speech-recognition", name, {
-        device: "wasm", dtype: "q8",
-        progress_callback: function (p) {
-          if (p && p.status === "progress" && typeof p.progress === "number") setStatus("Model yükleniyor… %" + Math.round(p.progress), p.file || "");
-        }
-      });
-    }).then(function (pipe) { asr = pipe; asrModel = name; dbg("model hazır: " + name); });
+    var w = ensureWorker();
+    return new Promise(function (resolve, reject) {
+      loadWaiter = { resolve: resolve, reject: reject };
+      w.postMessage({ type: "load", model: name });
+    });
   }
 
   function resample16k(f32, rate) {
@@ -330,12 +383,15 @@
   }
 
   function runSegQueue() {
-    if (asrBusy || !segQueue.length || !asr) return;
+    if (asrBusy || !segQueue.length || !readyModel || !worker) return;
     asrBusy = true;
     var audio = segQueue.shift();
     if (wActive) setStatus("Çözümleniyor…", "Whisper (cihazda)");
-    asr(audio, { language: "german", task: "transcribe", chunk_length_s: 30 }).then(function (out) {
-      var text = ((out && out.text) || "").trim();
+    new Promise(function (resolve, reject) {
+      runWaiter = { resolve: resolve, reject: reject };
+      worker.postMessage({ type: "run", audio: audio }, [audio.buffer]);
+    }).then(function (text) {
+      text = (text || "").trim();
       dbg("metin: " + (text || "(boş)"));
       if (text.length > 1 && !HALLUC.test(text) && /\p{L}/u.test(text)) addPhrase(text);
     }).catch(function (e) { dbg("çözüm hatası: " + (e && e.message)); })
@@ -382,11 +438,7 @@
     var AC = window.AudioContext || window.webkitAudioContext;
     try { wCtx = new AC({ sampleRate: 16000 }); } catch (e) { wCtx = new AC(); }
     try { wCtx.resume(); } catch (e) { /* devam */ }
-    loadAsr().then(function () {
-      if (!wActive) return null;
-      return navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
-    }).then(function (stream) {
-      if (!stream) return;
+    navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true } }).then(function (stream) {
       if (!wActive) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
       wStream = stream;
       wSrc = wCtx.createMediaStreamSource(stream);
@@ -395,7 +447,12 @@
       wProc.onaudioprocess = function (e) { onFrame(e.inputBuffer.getChannelData(0)); };
       wSrc.connect(wGainNode); wGainNode.connect(wProc); wProc.connect(wCtx.destination);
       dbg("mikrofon açıldı, örnekleme " + wCtx.sampleRate + " Hz");
-      setStatus("Dinliyorum…", "Whisper (cihazda)");
+      // Model arka planda yüklenirken mikrofon ve seviye çubuğu zaten çalışır.
+      return loadAsr().then(function () {
+        if (!wActive) return;
+        setStatus("Dinliyorum…", "Whisper (cihazda)");
+        runSegQueue();
+      });
     }).catch(function (e) {
       dbg("whisper hata: " + (e && (e.name || e.message)));
       setError(e && e.name === "NotAllowedError" ? "Mikrofon izni verilmedi." : "Başlatılamadı: " + ((e && e.message) || e));
