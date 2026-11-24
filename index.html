@@ -69,14 +69,37 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2Z"/></svg>
       </button>
       <div id="status" aria-live="polite">Hazır<small>Dinlemek için mikrofona dokun.</small></div>
-      <label for="lang" class="empty">Dil
-        <select id="lang">
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <select id="mode" aria-label="Dinleme modu">
+          <option value="sr" selected>Hızlı (tarayıcı)</option>
+          <option value="whisper">Whisper (TV sesi)</option>
+        </select>
+        <select id="lang" aria-label="Dil">
           <option value="de-DE" selected>Almanca</option>
           <option value="">Cihaz dili</option>
         </select>
-      </label>
+      </div>
     </div>
     <p id="err" role="alert"></p>
+  </section>
+
+  <section class="panel" id="wpanel" hidden>
+    <h2>Whisper ayarları</h2>
+    <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <label for="model" class="empty">Model</label>
+      <select id="model">
+        <option value="Xenova/whisper-tiny">Küçük (~40 MB, hızlı)</option>
+        <option value="Xenova/whisper-base" selected>Orta (~80 MB, dengeli)</option>
+        <option value="Xenova/whisper-small">Büyük (~250 MB, en doğru, yavaş)</option>
+      </select>
+    </div>
+    <div class="row" style="display:flex;gap:10px;align-items:center;margin-top:10px">
+      <label for="gain" class="empty">Ses yükseltme</label>
+      <input id="gain" type="range" min="1" max="12" step="0.5" value="4" style="flex:1;accent-color:var(--accent)">
+      <output id="gainOut" for="gain" style="min-width:3ch;text-align:right">4x</output>
+    </div>
+    <div style="margin-top:10px;height:8px;background:#232b36;border-radius:4px;overflow:hidden"><div id="meter" style="height:100%;width:0%;background:var(--accent)"></div></div>
+    <p class="empty" style="margin:8px 0 0">Bu modda ses cihazda çözülür. İlk açılışta model indirilir, sonra hazır kalır. Yazı cümle bitince, 1-3 saniye gecikmeyle gelir.</p>
   </section>
 
   <section class="panel">
@@ -92,6 +115,11 @@
   <section class="panel">
     <h2>Cümleler</h2>
     <ul id="log"><li class="empty">Henüz cümle yok.</li></ul>
+  </section>
+
+  <section class="panel">
+    <h2>Teşhis</h2>
+    <pre id="dbg" style="margin:0;white-space:pre-wrap;font-size:.8rem;color:var(--muted)">Henüz olay yok.</pre>
   </section>
 
   <div class="actions">
@@ -118,6 +146,12 @@
   function setStatus(main, sub) {
     statusEl.textContent = main;
     if (sub) { var s = document.createElement("small"); s.textContent = sub; statusEl.appendChild(s); }
+  }
+  var dbgEl = $("dbg"), dbgLines = [];
+  function dbg(m) {
+    dbgLines.push(new Date().toLocaleTimeString("tr-TR") + "  " + m);
+    if (dbgLines.length > 14) dbgLines.shift();
+    dbgEl.textContent = dbgLines.join("\n");
   }
   function setError(msg) { errEl.textContent = msg || ""; }
   function str(v, max) { return typeof v === "string" ? v.slice(0, max || 80) : ""; }
@@ -256,6 +290,146 @@
     schedulePump(100);
   }
 
+  /* ---------- Whisper modu (cihazda ses tanıma) ---------- */
+  var modeEl = $("mode"), wpanel = $("wpanel"), gainEl = $("gain"), gainOut = $("gainOut"), meterEl = $("meter"), modelEl = $("model");
+  var asr = null, asrModel = "", asrBusy = false, segQueue = [];
+  var wCtx = null, wStream = null, wSrc = null, wGainNode = null, wProc = null, wActive = false;
+  var seg = [], pre = [], speaking = false, silentSec = 0, segSec = 0;
+  var VOICE_RMS = 0.02, SILENCE_END = 0.9, SEG_MAX = 12, SEG_MIN = 0.5;
+  var HALLUC = /(amara\.org|untertitel|vielen dank (fürs|für das) zuschauen|copyright)/i;
+
+  function loadAsr() {
+    var name = modelEl.value;
+    if (asr && asrModel === name) return Promise.resolve();
+    setStatus("Model yükleniyor…", "İlk seferde indirme biraz sürer.");
+    return import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.5").then(function (mod) {
+      return mod.pipeline("automatic-speech-recognition", name, {
+        device: "wasm", dtype: "q8",
+        progress_callback: function (p) {
+          if (p && p.status === "progress" && typeof p.progress === "number") setStatus("Model yükleniyor… %" + Math.round(p.progress), p.file || "");
+        }
+      });
+    }).then(function (pipe) { asr = pipe; asrModel = name; dbg("model hazır: " + name); });
+  }
+
+  function resample16k(f32, rate) {
+    if (rate === 16000) return f32;
+    var ratio = rate / 16000, n = Math.floor(f32.length / ratio), out = new Float32Array(n);
+    for (var i = 0; i < n; i++) {
+      var pos = i * ratio, i0 = Math.floor(pos), i1 = Math.min(i0 + 1, f32.length - 1), fr = pos - i0;
+      out[i] = f32[i0] * (1 - fr) + f32[i1] * fr;
+    }
+    return out;
+  }
+
+  function concat(frames) {
+    var n = 0; frames.forEach(function (f) { n += f.length; });
+    var out = new Float32Array(n), o = 0;
+    frames.forEach(function (f) { out.set(f, o); o += f.length; });
+    return out;
+  }
+
+  function runSegQueue() {
+    if (asrBusy || !segQueue.length || !asr) return;
+    asrBusy = true;
+    var audio = segQueue.shift();
+    if (wActive) setStatus("Çözümleniyor…", "Whisper (cihazda)");
+    asr(audio, { language: "german", task: "transcribe", chunk_length_s: 30 }).then(function (out) {
+      var text = ((out && out.text) || "").trim();
+      dbg("metin: " + (text || "(boş)"));
+      if (text.length > 1 && !HALLUC.test(text) && /\p{L}/u.test(text)) addPhrase(text);
+    }).catch(function (e) { dbg("çözüm hatası: " + (e && e.message)); })
+      .then(function () {
+        asrBusy = false;
+        if (wActive) setStatus("Dinliyorum…", "Whisper (cihazda)");
+        runSegQueue();
+      });
+  }
+
+  function finalizeSeg() {
+    var voiced = segSec - silentSec;
+    var frames = seg; seg = []; speaking = false; silentSec = 0; segSec = 0; pre = [];
+    if (voiced < SEG_MIN) return;
+    var audio = resample16k(concat(frames), wCtx.sampleRate);
+    dbg("segment " + (audio.length / 16000).toFixed(1) + " sn");
+    if (segQueue.length >= 4) { segQueue.shift(); dbg("kuyruk dolu, eski segment atlandı"); }
+    segQueue.push(audio);
+    runSegQueue();
+  }
+
+  function onFrame(input) {
+    var f = new Float32Array(input.length), sum = 0;
+    for (var i = 0; i < input.length; i++) {
+      var v = Math.max(-1, Math.min(1, input[i]));
+      f[i] = v; sum += v * v;
+    }
+    var rms = Math.sqrt(sum / input.length), sec = input.length / wCtx.sampleRate;
+    meterEl.style.width = Math.min(100, rms / 0.2 * 100) + "%";
+    if (rms >= VOICE_RMS) {
+      if (!speaking) { speaking = true; seg = pre.slice(); segSec = pre.length * sec; dbg("ses algılandı"); }
+      seg.push(f); segSec += sec; silentSec = 0;
+    } else if (speaking) {
+      seg.push(f); segSec += sec; silentSec += sec;
+    } else {
+      pre.push(f); if (pre.length > 2) pre.shift();
+    }
+    if (speaking && (silentSec >= SILENCE_END || segSec >= SEG_MAX)) finalizeSeg();
+  }
+
+  function whisperStart() {
+    setError(""); wActive = true;
+    mic.classList.add("on"); mic.setAttribute("aria-label", "Dinlemeyi durdur");
+    var AC = window.AudioContext || window.webkitAudioContext;
+    try { wCtx = new AC({ sampleRate: 16000 }); } catch (e) { wCtx = new AC(); }
+    try { wCtx.resume(); } catch (e) { /* devam */ }
+    loadAsr().then(function () {
+      if (!wActive) return null;
+      return navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
+    }).then(function (stream) {
+      if (!stream) return;
+      if (!wActive) { stream.getTracks().forEach(function (t) { t.stop(); }); return; }
+      wStream = stream;
+      wSrc = wCtx.createMediaStreamSource(stream);
+      wGainNode = wCtx.createGain(); wGainNode.gain.value = parseFloat(gainEl.value);
+      wProc = wCtx.createScriptProcessor(4096, 1, 1);
+      wProc.onaudioprocess = function (e) { onFrame(e.inputBuffer.getChannelData(0)); };
+      wSrc.connect(wGainNode); wGainNode.connect(wProc); wProc.connect(wCtx.destination);
+      dbg("mikrofon açıldı, örnekleme " + wCtx.sampleRate + " Hz");
+      setStatus("Dinliyorum…", "Whisper (cihazda)");
+    }).catch(function (e) {
+      dbg("whisper hata: " + (e && (e.name || e.message)));
+      setError(e && e.name === "NotAllowedError" ? "Mikrofon izni verilmedi." : "Başlatılamadı: " + ((e && e.message) || e));
+      whisperStop();
+    });
+  }
+
+  function whisperStop() {
+    var was = wActive; wActive = false;
+    if (speaking) { try { finalizeSeg(); } catch (e) { /* yoksay */ } }
+    try { if (wProc) { wProc.onaudioprocess = null; wProc.disconnect(); } } catch (e) { /* yoksay */ }
+    try { if (wSrc) wSrc.disconnect(); } catch (e) { /* yoksay */ }
+    try { if (wGainNode) wGainNode.disconnect(); } catch (e) { /* yoksay */ }
+    if (wStream) wStream.getTracks().forEach(function (t) { t.stop(); });
+    try { if (wCtx) wCtx.close(); } catch (e) { /* yoksay */ }
+    wStream = wSrc = wGainNode = wProc = wCtx = null;
+    meterEl.style.width = "0%";
+    mic.classList.remove("on"); mic.setAttribute("aria-label", "Dinlemeyi başlat");
+    if (was) setStatus("Durdu", "Tekrar dinlemek için mikrofona dokun.");
+  }
+
+  gainEl.addEventListener("input", function () {
+    gainOut.textContent = gainEl.value + "x";
+    if (wGainNode) wGainNode.gain.value = parseFloat(gainEl.value);
+  });
+
+  modeEl.addEventListener("change", function () {
+    if (wantListen) { wantListen = false; try { rec.stop(); } catch (e) { /* yoksay */ } }
+    if (wActive) whisperStop();
+    wpanel.hidden = modeEl.value !== "whisper";
+    setError("");
+    setStatus("Hazır", modeEl.value === "whisper" ? "Whisper: dokununca model yüklenir, sonra dinler." : "Dinlemek için mikrofona dokun.");
+  });
+
   /* ---------- Konuşma tanıma ---------- */
   function build() {
     var r = new SR();
@@ -263,16 +437,22 @@
     r.continuous = true;
     r.interimResults = true;
     r.maxAlternatives = 1;
-    r.onstart = function () { setStatus("Dinliyorum…", langEl.value ? "Almanca" : "Cihaz dili"); };
+    r.onaudiostart = function () { dbg("mikrofon açıldı"); };
+    r.onsoundstart = function () { dbg("ses algılandı"); };
+    r.onspeechstart = function () { dbg("konuşma algılandı"); };
+    r.onspeechend = function () { dbg("konuşma bitti"); };
+    r.onnomatch = function () { dbg("eşleşme yok"); };
+    r.onstart = function () { dbg("dinleme başladı");  setStatus("Dinliyorum…", langEl.value ? "Almanca" : "Cihaz dili"); };
     r.onresult = function (ev) {
       var interim = "";
       for (var i = ev.resultIndex; i < ev.results.length; i++) {
         var res = ev.results[i], t = res[0].transcript.trim();
-        if (res.isFinal) { if (t) addPhrase(t); } else interim += t + " ";
+        if (res.isFinal) { dbg("kesin sonuç: " + t); if (t) addPhrase(t); } else interim += t + " ";
       }
       setLive(interim.trim());
     };
     r.onerror = function (ev) {
+      dbg("hata: " + ev.error);
       if (ev.error === "no-speech" || ev.error === "aborted") return;
       if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
         wantListen = false;
@@ -281,14 +461,15 @@
         setError("Ağ hatası. Tanıma için internet bağlantısı gerekir.");
       } else if (ev.error === "language-not-supported") {
         wantListen = false;
-        setError("Bu cihaz Almanca tanımayı desteklemiyor. Dil menüsünden \"Cihaz dili\"ni seç ya da cihaza Almanca ses tanıma dilini ekle.");
+        setError("Bu cihaz Almanca tanımayı desteklemiyor. Dil menüsünden Cihaz dilini seç ya da cihaza Almanca ses tanıma dilini ekle.");
       } else {
         setError("Hata: " + ev.error);
       }
     };
     r.onend = function () {
       setLive("");
-      if (wantListen) { try { r.start(); } catch (e) { /* zaten başlıyor */ } }
+      dbg("dinleme bitti" + (wantListen ? ", yeniden başlıyor" : ""));
+      if (wantListen) { setTimeout(function () { if (wantListen) { try { r.start(); } catch (e) { dbg("yeniden başlatılamadı: " + e.message); } } }, 250); }
       else { mic.classList.remove("on"); mic.setAttribute("aria-label", "Dinlemeyi başlat"); setStatus("Durdu", "Tekrar dinlemek için mikrofona dokun."); }
     };
     return r;
@@ -303,6 +484,7 @@
   }
 
   mic.addEventListener("click", function () {
+    if (modeEl.value === "whisper") { if (wActive) whisperStop(); else whisperStart(); return; }
     if (wantListen) { wantListen = false; rec.stop(); return; }
     startListening();
   });
