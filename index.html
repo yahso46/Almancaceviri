@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Almanca Dinleyici</title>
+<style>
+  :root {
+    --bg: #14181f;
+    --panel: #1d232d;
+    --line: #2c3541;
+    --text: #eef1f5;
+    --muted: #9aa5b4;
+    --accent: #ffcc33;
+    --accent-ink: #1a1400;
+    --danger: #ff6b5e;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--font); }
+  body { min-height: 100%; padding: 20px 16px 48px; }
+  main { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
+  h1 { font-size: 1.5rem; margin: 0; text-wrap: balance; }
+  h1 span { color: var(--accent); }
+  p.sub { margin: 4px 0 0; color: var(--muted); font-size: .95rem; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  .panel h2 { font-size: .8rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+  .controls { display: flex; align-items: center; gap: 14px; }
+  #mic { width: 76px; height: 76px; border-radius: 50%; border: 0; cursor: pointer; background: var(--accent); color: var(--accent-ink); font-size: 0; flex: none; display: grid; place-items: center; }
+  #mic svg { width: 34px; height: 34px; fill: currentColor; }
+  #mic.on { background: var(--danger); color: #fff; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,107,94,.5); } 50% { box-shadow: 0 0 0 14px rgba(255,107,94,0); } }
+  @media (prefers-reduced-motion: reduce) { #mic.on { animation: none; } }
+  #status { font-size: 1rem; flex: 1; }
+  #status small { display: block; color: var(--muted); font-size: .85rem; margin-top: 2px; }
+  select { background: #232b36; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; font-size: .9rem; }
+  :focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+  #live { min-height: 2.6em; font-size: 1.6rem; line-height: 1.3; color: var(--accent); overflow-wrap: anywhere; }
+  #live:empty::before { content: "Konuşmaya başla, kelimeler burada canlı yazılır."; color: var(--muted); font-size: 1rem; }
+  #words { display: flex; flex-wrap: wrap; gap: 8px; min-height: 2em; }
+  .chip { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; background: #2a3340; border: 1px solid var(--line); border-radius: 12px; padding: 6px 12px; font-size: 1rem; }
+  .chip b { color: var(--accent); font-variant-numeric: tabular-nums; margin-left: 6px; font-weight: 600; }
+  .chip .gl { color: var(--muted); font-size: .8rem; }
+  .chip.pending { border-style: dashed; background: transparent; color: var(--accent); }
+  .chip.pending .gl { font-style: italic; }
+  .empty { color: var(--muted); font-size: .95rem; }
+  #log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  #log li { padding: 10px 12px; background: #232b36; border-radius: 8px; font-size: 1.05rem; overflow-wrap: anywhere; }
+  #log li.empty { background: none; padding: 0; }
+  #log li .tr { display: block; margin-top: 4px; color: var(--accent); font-size: 1rem; }
+  #log li .tr.wait { color: var(--muted); font-style: italic; }
+  #log li .wl { display: block; margin-top: 4px; color: var(--muted); font-size: .8rem; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  button.sec { background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; font-size: .95rem; cursor: pointer; }
+  #err { color: var(--danger); font-size: .95rem; margin: 10px 0 0; }
+  #err:empty { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Almanca <span>Dinleyici</span></h1>
+    <p class="sub">Duyduğu kelimeleri canlı yazar, Türkçe anlamlarını gösterir.</p>
+  </header>
+
+  <section class="panel">
+    <div class="controls">
+      <button id="mic" type="button" aria-label="Dinlemeyi başlat">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2Z"/></svg>
+      </button>
+      <div id="status" aria-live="polite">Hazır<small>Dinlemek için mikrofona dokun.</small></div>
+      <label for="lang" class="empty">Dil
+        <select id="lang">
+          <option value="de-DE" selected>Almanca</option>
+          <option value="">Cihaz dili</option>
+        </select>
+      </label>
+    </div>
+    <p id="err" role="alert"></p>
+  </section>
+
+  <section class="panel">
+    <h2>Şu an duyulan</h2>
+    <div id="live" aria-live="polite"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Kelimeler</h2>
+    <div id="words"><span class="empty">Henüz kelime yok.</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Cümleler</h2>
+    <ul id="log"><li class="empty">Henüz cümle yok.</li></ul>
+  </section>
+
+  <div class="actions">
+    <button class="sec" id="copy" type="button">Metni kopyala</button>
+    <button class="sec" id="clear" type="button">Temizle</button>
+  </div>
+</main>
+
+<script>
+(function () {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var $ = function (id) { return document.getElementById(id); };
+  var mic = $("mic"), statusEl = $("status"), errEl = $("err"), liveEl = $("live");
+  var wordsEl = $("words"), logEl = $("log"), langEl = $("lang");
+  var WORD_RE = /[\p{L}][\p{L}'’-]*/gu;
+
+  var rec = null, wantListen = false, interimWords = [];
+  var phrases = [];
+  var counts = new Map();            // küçük harf -> {text, n}
+  var glossCache = new Map();        // küçük harf -> Türkçe anlam
+  var glossQueue = new Set(), sentQueue = [];
+  var busy = false, backoffUntil = 0, pumpTimer = null, transError = "";
+
+  function setStatus(main, sub) {
+    statusEl.textContent = main;
+    if (sub) { var s = document.createElement("small"); s.textContent = sub; statusEl.appendChild(s); }
+  }
+  function setError(msg) { errEl.textContent = msg || ""; }
+  function str(v, max) { return typeof v === "string" ? v.slice(0, max || 80) : ""; }
+  function gloss(w) { return glossCache.get(w.toLowerCase()) || ""; }
+
+  if (!SR) {
+    mic.disabled = true;
+    setStatus("Desteklenmiyor", "Bu tarayıcı konuşma tanımayı desteklemiyor. Chrome veya Safari kullan.");
+    return;
+  }
+
+  /* ---------- Çeviri (sunucu: /api/translate) ---------- */
+  function api(body) {
+    return fetch("/api/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) {
+        if (!r.ok) { var e = new Error(j.error || "http_" + r.status); e.status = r.status; e.code = j.error; throw e; }
+        return j;
+      });
+    });
+  }
+
+  function schedulePump(ms) { clearTimeout(pumpTimer); pumpTimer = setTimeout(pump, ms); }
+
+  function queueWords(words) {
+    var added = false;
+    words.forEach(function (w) { var k = w.toLowerCase(); if (!glossCache.has(k)) { glossQueue.add(k); added = true; } });
+    if (added) schedulePump(700);
+  }
+
+  function onTransError(e) {
+    if (e.status === 429) { backoffUntil = Date.now() + 20000; transError = "Çeviri yavaşlatıldı, birkaç saniye bekleniyor."; schedulePump(20000); }
+    else if (e.code === "no_key") transError = "Sunucuda DEEPSEEK_API_KEY tanımlı değil. Vercel ortam değişkenlerine ekleyip yeniden deploy et.";
+    else if (e.code === "upstream") transError = "DeepSeek isteği reddetti. API anahtarını ve bakiyeni kontrol et.";
+    else transError = "Çeviri alınamadı.";
+  }
+
+  function doWords() {
+    var batch = Array.from(glossQueue).slice(0, 25);
+    batch.forEach(function (k) { glossQueue.delete(k); });
+    return api({ mode: "words", words: batch }).then(function (r) {
+      var m = (r && typeof r.meanings === "object" && r.meanings) || {};
+      var lower = {};
+      Object.keys(m).forEach(function (k) { lower[k.toLowerCase()] = m[k]; });
+      batch.forEach(function (k) { glossCache.set(k, str(lower[k], 40) || "?"); });
+    });
+  }
+
+  function doSentence(ph) {
+    return api({ mode: "sentence", text: ph.text }).then(function (r) {
+      ph.tr = str(r && r.translation, 400) || "?";
+      ph.words = [];
+      ((r && Array.isArray(r.words)) ? r.words : []).slice(0, 60).forEach(function (w) {
+        var de = str(w && w.de, 40), tr = str(w && w.tr, 40);
+        if (de && tr) { ph.words.push({ de: de, tr: tr }); glossCache.set(de.toLowerCase(), tr); } // cümleye uygun anlam öncekinin yerini alır
+      });
+    });
+  }
+
+  function pump() {
+    if (busy || Date.now() < backoffUntil) return;
+    var job;
+    if (sentQueue.length) job = sentQueue.shift();
+    else if (glossQueue.size) job = "words";
+    else return;
+    busy = true; transError = "";
+    (job === "words" ? doWords() : doSentence(job)).catch(function (e) {
+      if (job !== "words") job.tr = "(çevrilemedi)";
+      onTransError(e);
+    }).then(function () {
+      busy = false;
+      render();
+      if ((sentQueue.length || glossQueue.size) && Date.now() >= backoffUntil && !transError) schedulePump(300);
+    });
+  }
+
+  /* ---------- Ekran ---------- */
+  function render() {
+    wordsEl.textContent = "";
+    interimWords.forEach(function (w) {
+      var c = document.createElement("span"); c.className = "chip pending";
+      var t = document.createElement("span"); t.textContent = w; c.appendChild(t);
+      var g = document.createElement("span"); g.className = "gl"; g.textContent = gloss(w) || "…"; c.appendChild(g);
+      wordsEl.appendChild(c);
+    });
+    if (!counts.size && !interimWords.length) {
+      var e = document.createElement("span"); e.className = "empty"; e.textContent = "Henüz kelime yok."; wordsEl.appendChild(e);
+    } else {
+      Array.from(counts.values()).sort(function (a, b) { return b.n - a.n || a.text.localeCompare(b.text, "de"); })
+        .forEach(function (w) {
+          var c = document.createElement("span"); c.className = "chip";
+          var top = document.createElement("span"); top.textContent = w.text;
+          var b = document.createElement("b"); b.textContent = w.n; top.appendChild(b); c.appendChild(top);
+          var gl = gloss(w.text);
+          if (gl) { var g = document.createElement("span"); g.className = "gl"; g.textContent = gl; c.appendChild(g); }
+          wordsEl.appendChild(c);
+        });
+    }
+    if (transError) setError(transError);
+    logEl.textContent = "";
+    if (!phrases.length) {
+      var li0 = document.createElement("li"); li0.className = "empty"; li0.textContent = "Henüz cümle yok."; logEl.appendChild(li0);
+    } else {
+      phrases.slice().reverse().forEach(function (p) {
+        var li = document.createElement("li"); li.textContent = p.text;
+        var tr = document.createElement("span"); tr.className = "tr" + (p.tr ? "" : " wait");
+        tr.textContent = p.tr || "çevriliyor…"; li.appendChild(tr);
+        if (p.words && p.words.length) {
+          var wl = document.createElement("span"); wl.className = "wl";
+          wl.textContent = p.words.map(function (w) { return w.de + " = " + w.tr; }).join(" · "); li.appendChild(wl);
+        }
+        logEl.appendChild(li);
+      });
+    }
+  }
+
+  function setLive(t) {
+    liveEl.textContent = t;
+    interimWords = t.match(WORD_RE) || [];
+    render();
+    if (interimWords.length) queueWords(interimWords);
+  }
+
+  function addPhrase(text) {
+    var ph = { text: text, tr: "", words: [] };
+    phrases.push(ph);
+    (text.match(WORD_RE) || []).forEach(function (w) {
+      var k = w.toLowerCase(), e = counts.get(k);
+      if (e) e.n++; else counts.set(k, { text: w, n: 1 });
+    });
+    sentQueue.push(ph);
+    render();
+    schedulePump(100);
+  }
+
+  /* ---------- Konuşma tanıma ---------- */
+  function build() {
+    var r = new SR();
+    if (langEl.value) r.lang = langEl.value;
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+    r.onstart = function () { setStatus("Dinliyorum…", langEl.value ? "Almanca" : "Cihaz dili"); };
+    r.onresult = function (ev) {
+      var interim = "";
+      for (var i = ev.resultIndex; i < ev.results.length; i++) {
+        var res = ev.results[i], t = res[0].transcript.trim();
+        if (res.isFinal) { if (t) addPhrase(t); } else interim += t + " ";
+      }
+      setLive(interim.trim());
+    };
+    r.onerror = function (ev) {
+      if (ev.error === "no-speech" || ev.error === "aborted") return;
+      if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+        wantListen = false;
+        setError("Mikrofon izni verilmedi. Adres çubuğundaki izin ayarından mikrofona izin ver ve tekrar dene.");
+      } else if (ev.error === "network") {
+        setError("Ağ hatası. Tanıma için internet bağlantısı gerekir.");
+      } else if (ev.error === "language-not-supported") {
+        wantListen = false;
+        setError("Bu cihaz Almanca tanımayı desteklemiyor. Dil menüsünden \"Cihaz dili\"ni seç ya da cihaza Almanca ses tanıma dilini ekle.");
+      } else {
+        setError("Hata: " + ev.error);
+      }
+    };
+    r.onend = function () {
+      setLive("");
+      if (wantListen) { try { r.start(); } catch (e) { /* zaten başlıyor */ } }
+      else { mic.classList.remove("on"); mic.setAttribute("aria-label", "Dinlemeyi başlat"); setStatus("Durdu", "Tekrar dinlemek için mikrofona dokun."); }
+    };
+    return r;
+  }
+
+  function startListening() {
+    setError("");
+    wantListen = true;
+    rec = build();
+    try { rec.start(); mic.classList.add("on"); mic.setAttribute("aria-label", "Dinlemeyi durdur"); }
+    catch (e) { wantListen = false; setError("Başlatılamadı: " + e.message); }
+  }
+
+  mic.addEventListener("click", function () {
+    if (wantListen) { wantListen = false; rec.stop(); return; }
+    startListening();
+  });
+
+  langEl.addEventListener("change", function () {
+    if (wantListen) { wantListen = false; rec.stop(); setTimeout(startListening, 400); }
+  });
+
+  $("clear").addEventListener("click", function () {
+    phrases = []; counts.clear(); sentQueue = []; setLive("");
+  });
+
+  $("copy").addEventListener("click", function () {
+    var text = phrases.map(function (p) { return p.text + (p.tr ? "\n" + p.tr : ""); }).join("\n\n");
+    var btn = $("copy");
+    function done(msg) { btn.textContent = msg; setTimeout(function () { btn.textContent = "Metni kopyala"; }, 1600); }
+    if (!text) { done("Kopyalanacak metin yok"); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done("Kopyalandı"); }, function () { done("Kopyalanamadı"); });
+    } else done("Kopyalanamadı");
+  });
+
+  // Sayfa açılınca mikrofon iznini kendiliğinden iste; izin gelirse dinlemeyi başlat.
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    setStatus("İzin bekleniyor…", "Mikrofon iznini onayla.");
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+      startListening();
+    }, function () {
+      setStatus("Hazır", "Mikrofon izni yok. Mikrofona dokununca tekrar sorulur.");
+      setError("Mikrofon izni verilmedi. Tarayıcı ayarlarından mikrofona izin ver.");
+    });
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>
